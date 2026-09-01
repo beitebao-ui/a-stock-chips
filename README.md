@@ -56,6 +56,8 @@ Sources: EastMoney/Sina/Tencent/Hikyuu dual-channel cross-check
 | Volume-efficiency / limit-up sentiment / unlock-risk alerts | ❌ | ✅ |
 
 > 💎 **Upgrade to Pro**: unlock anti-quant pattern detection (11 quant harvesting patterns), watchlist monitoring, unlimited batch reports. Contact the author for a license key.
+>
+> 🔥 **First-month promo: 9.9 CNY (regular 199/month) — first 20 users only.** DM the author to claim.
 
 ## Data Sources & Reliability
 
