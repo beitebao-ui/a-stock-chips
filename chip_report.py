@@ -11,7 +11,7 @@
 
 依赖: requests, numpy (暗盘计算需要 Hikyuu)
 数据源: 东财 datacenter + emweb + 新浪兜底 + 腾讯行情 + Hikyuu 本地K线
-2026-09-01 Free v1.0: 开源免费版 — 每日限 1 次筹码报告。3 个数据 bug 修复已内置。
+2026-09-01 Free v1.0: 专业版 — 无限次筹码报告。3 个数据 bug 修复已内置。
 专业版(付费): 无限次/批量/反量化套路识别/自选池监控/话术帖鉴别 — 见 README.md
 """
 import sys, os, re, json, datetime, time
@@ -89,7 +89,29 @@ def get_quote(code, market):
 
 
 def get_holder_num(code, market):
-    """股东户数 (含新鲜度校验: >400天=数据缺失)"""
+    """股东户数 — 主源: 东财F10 gdrs (改名票/新代码也覆盖), 备源: datacenter RPT_HOLDERNUM_DET
+    (2026-09 修复: datacenter 报表对改名票(如600844丹化→金煤)只回2019年旧数据, F10 gdrs 数据完整新鲜)
+    """
+    # ---- 主源: F10 PageAjax gdrs ----
+    try:
+        url = f"https://emweb.securities.eastmoney.com/PC_HSF10/ShareholderResearch/PageAjax?code={market}{code}"
+        d = get(url, retry=2)
+        gdrs = (d or {}).get("gdrs") or []
+        if gdrs:
+            latest = str(gdrs[0].get("END_DATE", ""))[:10]
+            try:
+                days = (datetime.date.today() - datetime.date.fromisoformat(latest)).days
+            except Exception:
+                days = 9999
+            if days <= 400:
+                seq = [{"date": str(r.get("END_DATE", ""))[:10],
+                        "num": r.get("HOLDER_TOTAL_NUM"),
+                        "ratio": r.get("TOTAL_NUM_RATIO")} for r in gdrs[:8]]
+                return {"status": "ok", "seq": seq}
+            return {"status": "missing", "latest": latest, "days": days}
+    except Exception:
+        pass
+    # ---- 备源: datacenter RPT_HOLDERNUM_DET ----
     url = "https://datacenter.eastmoney.com/securities/api/data/v1/get"
     params = {"reportName": "RPT_HOLDERNUM_DET", "columns": "ALL", "pageSize": "8",
               "sortColumns": "END_DATE", "sortTypes": "-1",
@@ -217,33 +239,23 @@ def get_fundflow(code, market):
 
 
 # ==================== 暗盘层 (Hikyuu 三角形筹码) ====================
-def compute_chips(code, market, float_shares):
-    """筹码分布 — 复制自 chip_distribution.py (含腾讯实时价核对)。返回 dict"""
-    full = f"{market.lower()}{code}"
+# Hikyuu 可选化 (embeddable python / 未装 hikyuu 时暗盘层降级, 明盘+反量化不受影响)
+try:
     import hikyuu.interactive  # 触发 Hikyuu 完整初始化 (数据目录加载)
     from hikyuu import StockManager, Query
-    sm = StockManager.instance()
-    s = sm[full]
-    if s is None:
-        for st in sm:
-            if st.code == code and st.market == market:
-                s = st
-                break
-    if s is None:
-        return {"error": f"Hikyuu 无 {full}"}
-    k = s.get_kdata(Query(-1000, ktype="DAY"))
-    closes = np.array([float(d.close) for d in k], dtype=float)
-    highs = np.array([float(d.high) for d in k], dtype=float)
-    lows = np.array([float(d.low) for d in k], dtype=float)
-    vols = np.array([float(d.volume) for d in k], dtype=float)
+    HKU_OK = True
+except Exception:
+    HKU_OK = False
+
+
+def _chips_from_kdata(closes, highs, lows, vols, float_shares, cur, k_start, k_end, price_src):
+    """三角形筹码模型核心计算 (纯函数, 数据源无关)"""
     n = len(closes)
     if n < 60:
         return {"error": f"K线不足60根 ({n})"}
-
     float_hands = float_shares / 100.0
     turnover = vols / float_hands * 100.0
 
-    # 三角形权重分配
     lo_all, hi_all = lows.min(), highs.max()
     price_grid = np.linspace(lo_all * 0.95, hi_all * 1.05, 300)
     chips = np.zeros_like(price_grid)
@@ -272,23 +284,6 @@ def compute_chips(code, market, float_shares):
     if total_chips > 0:
         chips = chips / total_chips * float_hands
 
-    # 现价: Hikyuu 最后收盘, 腾讯实时核对
-    cur = closes[-1]
-    hk_date = str(k[-1].datetime)[:10]
-    rt = None
-    try:
-        r = requests.get(f"https://qt.gtimg.cn/q={market.lower()}{code}", timeout=8)
-        r.encoding = "gbk"
-        p_ = r.text.split("~")
-        if len(p_) > 45:
-            rt = float(p_[3])
-    except Exception:
-        pass
-    price_src = "hikyuu"
-    if rt and rt > 0 and abs(rt - cur) / cur > 0.005:
-        cur = rt
-        price_src = f"tencent({hk_date}->实时)"
-
     cum = np.cumsum(chips)
     total = cum[-1] if cum[-1] > 0 else 1
     profit_idx = np.where(price_grid <= cur)[0]
@@ -307,8 +302,8 @@ def compute_chips(code, market, float_shares):
     wavg60 = (closes[-60:] * vols[-60:]).sum() / vols[-60:].sum()
     wavg20 = (closes[-20:] * vols[-20:]).sum() / vols[-20:].sum()
 
-    return {"cur": round(cur, 2), "price_src": price_src, "k_start": str(k[0].datetime)[:10],
-            "k_end": hk_date, "n": n,
+    return {"cur": round(cur, 2), "price_src": price_src, "k_start": k_start,
+            "k_end": k_end, "n": n,
             "profit_ratio": round(profit_ratio, 1), "avg_cost": round(avg_cost, 2),
             "p10": round(p10, 2), "p90": round(p90, 2),
             "p15": round(p15, 2), "p85": round(p85, 2),
@@ -316,6 +311,90 @@ def compute_chips(code, market, float_shares):
             "turnover60": round(turnover[idx60:].sum()), "turnover120": round(turnover[-120:].sum()),
             "turnover250": round(turnover[-250:].sum()),
             "wavg60": round(wavg60, 2), "wavg20": round(wavg20, 2)}
+
+
+def _tencent_kline(code, market, days=800):
+    """腾讯前复权日K: 返回 (closes, highs, lows, vols, dates) 或 None"""
+    try:
+        r = requests.get("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+                         params={"param": f"{market.lower()}{code},day,,,{days},qfq"}, timeout=15)
+        j = r.json()
+        k = j["data"][f"{market.lower()}{code}"].get("qfqday") or j["data"][f"{market.lower()}{code}"].get("day")
+        if not k or len(k) < 60:
+            return None
+        closes = np.array([float(x[2]) for x in k], dtype=float)
+        highs = np.array([float(x[3]) for x in k], dtype=float)
+        lows = np.array([float(x[4]) for x in k], dtype=float)
+        vols = np.array([float(x[5]) for x in k], dtype=float)
+        dates = [x[0] for x in k]
+        return closes, highs, lows, vols, dates
+    except Exception:
+        return None
+
+
+def _realtime_price(code, market):
+    """腾讯实时价"""
+    try:
+        r = requests.get(f"https://qt.gtimg.cn/q={market.lower()}{code}", timeout=8)
+        r.encoding = "gbk"
+        p_ = r.text.split("~")
+        if len(p_) > 45 and p_[3]:
+            return float(p_[3])
+    except Exception:
+        pass
+    return None
+
+
+def compute_chips(code, market, float_shares):
+    """筹码分布 — hikyuu 优先, 无 hikyuu 自动切腾讯 K 线 (同模型)。返回 dict"""
+    # ---- 现价 (腾讯实时, 两数据源共用) ----
+    rt = _realtime_price(code, market)
+
+    if HKU_OK:
+        try:
+            full = f"{market.lower()}{code}"
+            sm = StockManager.instance()
+            s = sm[full]
+            if s is None:
+                for st in sm:
+                    if st.code == code and st.market == market:
+                        s = st
+                        break
+            if s is None:
+                return {"error": f"Hikyuu 无 {full}"}
+            k = s.get_kdata(Query(-1000, ktype="DAY"))
+            if len(k) < 60:
+                return {"error": f"Hikyuu K线不足60根 ({len(k)})"}
+            closes = np.array([float(d.close) for d in k], dtype=float)
+            highs = np.array([float(d.high) for d in k], dtype=float)
+            lows = np.array([float(d.low) for d in k], dtype=float)
+            vols = np.array([float(d.volume) for d in k], dtype=float)
+            cur = closes[-1]
+            k_end = str(k[-1].datetime)[:10]
+            k_start = str(k[0].datetime)[:10]
+            price_src = "hikyuu"
+            if rt and rt > 0 and abs(rt - cur) / cur > 0.005:
+                cur = rt
+                price_src = f"tencent({k_end}->实时)"
+            return _chips_from_kdata(closes, highs, lows, vols, float_shares, cur,
+                                     k_start, k_end, price_src)
+        except Exception as e:
+            # hikyuu 运行异常 → 降级腾讯
+            hku_err = str(e)
+
+    # ---- 腾讯 K 线 fallback (无 hikyuu / hikyuu 异常) ----
+    tk = _tencent_kline(code, market)
+    if tk is None:
+        return {"error": "hikyuu 不可用且腾讯 K 线获取失败, 暗盘层无法计算 (明盘+反量化正常)"}
+    closes, highs, lows, vols, dates = tk
+    cur = closes[-1]
+    k_start, k_end = dates[0], dates[-1]
+    price_src = "tencent"
+    if rt and rt > 0 and abs(rt - cur) / cur > 0.005:
+        cur = rt
+        price_src = f"tencent({k_end}->实时)"
+    return _chips_from_kdata(closes, highs, lows, vols, float_shares, cur,
+                             k_start, k_end, price_src)
 
 
 # ==================== 反量化层 (120日K线) ====================
@@ -397,10 +476,19 @@ def render_report(name, code, market, q, hn, sh, lhb_list, bt_list, rz, ff, ff_t
     # 股东户数
     if hn.get("status") == "ok":
         seq = hn["seq"]
-        first, last = seq[-1], seq[0]
+        last = seq[0]
         try:
-            trend = (float(last["num"]) / float(first["num"]) - 1) * 100
-            A(f"【股东户数】最新 {last['date']} {last['num']} (较{first['date']} {trend:+.0f}%)")
+            ratio = last.get("ratio")
+            if ratio is not None and str(ratio) not in ("", "None"):
+                rr = float(ratio)
+                A(f"【股东户数】最新 {last['date']} {last['num']} (环比 {rr:+.1f}%)")
+            else:
+                prev = seq[1] if len(seq) > 1 else None
+                if prev:
+                    rr = (float(last["num"]) / float(prev["num"]) - 1) * 100
+                    A(f"【股东户数】最新 {last['date']} {last['num']} (较上期 {rr:+.1f}%)")
+                else:
+                    A(f"【股东户数】最新 {last['date']} {last['num']}")
         except Exception:
             A(f"【股东户数】最新 {last['date']} {last['num']}")
     elif hn.get("status") == "missing":
@@ -518,31 +606,6 @@ def run_one(code, market=None, float_shares=None, verbose=True):
     return report
 
 
-
-def _check_free_limit():
-    """免费版限流: 每日 1 次 / 1 只。本地日期文件记录。"""
-    import datetime as _dt, os as _os
-    lf = _os.path.join(_os.path.expanduser("~"), ".a_stock_chips_free")
-    today = str(_dt.date.today())
-    try:
-        with open(lf, "r", encoding="utf-8") as f:
-            last = f.read().strip()
-    except Exception:
-        last = ""
-    if last == today:
-        print("⚠️ 免费版每日限 1 次筹码报告。")
-        print("💎 升级专业版解锁: 无限次 / 批量 / 反量化套路识别 / 自选池监控")
-        print("   详情见 README.md 或联系作者")
-        return False
-    with open(lf, "w", encoding="utf-8") as f:
-        f.write(today)
-    return True
-
-if __name__ == "__main__":
-    import sys as _sys
-    _free_ok = _check_free_limit()
-    if not _free_ok:
-        _sys.exit(0)
 
 if __name__ == "__main__":
     args = sys.argv[1:]
